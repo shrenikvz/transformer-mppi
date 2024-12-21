@@ -3,5 +3,9 @@ This project presents a novel approach to improve the Model Predictive Path Inte
 
 ![TransformerMPPI](./figures/transformer_mppi.png)
 
+**🚨 This repository is currently unstable and under active development 🚨**
+
+
+
 
 
