@@ -1,4 +1,4 @@
-# Transformer based Model Predictive Path Integral Control (TransformerMPPI)
+# Transformer based Model Predictive Path Integral Control
 
 ![TransformerMPPI](./figures/transformer_mppi.png)
 
