@@ -2,6 +2,8 @@
 
 Installable package and reproducible pipeline for **Transformer-based Model Predictive Path Integral (MPPI) control**.
 
+![Transformer-MPPI overview](figures/transformer_mppi.png)
+
 This refactor provides:
 - A reusable Python package API.
 - End-to-end data generation, training, and benchmarking pipelines.
