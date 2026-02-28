@@ -1,45 +1,78 @@
-# Transformer based Model Predictive Path Integral Control
+# Transformer-MPPI
 
-![TransformerMPPI](./figures/transformer_mppi.png)
+Installable package and reproducible pipeline for **Transformer-based Model Predictive Path Integral (MPPI) control**.
 
-This repository contains code accompanying the manuscript titled ["Transformer-based Model Predictive Path Integral Control"](https://arxiv.org/abs/2412.17118)
-
-## Abstract
-
-This project presents a novel approach to improve the Model Predictive Path Integral (MPPI) control by using a transformer to initialize the mean control sequence. Traditional MPPI methods often struggle with sample efficiency and computational costs due to suboptimal initial rollouts. We propose TransformerMPPI, which uses a transformer trained on historical control data to generate informed initial mean control sequences. TransformerMPPI combines the strengths of the attention mechanism in transformers and sampling-based control, leading to improved computational performance and sample efficiency. The ability of the transformer to capture long-horizon patterns in optimal control sequences allows TransformerMPPI to start from a more informed control sequence, reducing the number of samples required, and accelerating convergence to optimal control sequence.
+This refactor provides:
+- A reusable Python package API.
+- End-to-end data generation, training, and benchmarking pipelines.
+- Reproduction outputs (CSV metrics) aligned with the manuscript protocol.
+- A `quick` profile for practical local runs and a `paper` profile for full-scale settings.
 
 ## Installation
 
-First install the required dependencies by running the following command:
+```bash
+pip install -e .
+```
+
+## Package usage
+
+Distribution name is `transformer-mppi`; Python import path uses underscore:
+
+```python
+from transformer_mppi import TransformerMPPIController
+```
+
+### Loading a trained controller
+
+```python
+import torch
+from transformer_mppi import TransformerMPPIController
+
+controller = TransformerMPPIController.from_checkpoint(
+    checkpoint_dir="artifacts/racing/checkpoints/racing_quick",
+    dim_state=4,
+    dim_control=2,
+    dynamics=my_dynamics_fn,
+    cost_func=my_cost_fn,
+    u_min=torch.tensor([-2.0, -0.25]),
+    u_max=torch.tensor([2.0, 0.25]),
+    sigmas=torch.tensor([1.0, 1.0]),
+)
+```
+
+## Reproducible pipeline
+
+Run both tasks:
 
 ```bash
-pip3 install -U pip
-pip3 install --upgrade torch torchvision torchaudio
-pip3 install -upgrade -r requirements.txt
+python -m transformer_mppi.cli reproduce --task both --profile quick --circuit-csv circuit.csv --output-dir artifacts
 ```
 
-Then install the transformer-mppi package by running the following command:
+Run one task:
 
 ```bash
-git clone https://github.com/shrenikvz/transformer-mppi.git
-cd transformer-mppi
-pip3 install -e .
+python -m transformer_mppi.cli reproduce --task navigation2d --profile quick --output-dir artifacts
+python -m transformer_mppi.cli reproduce --task racing --profile quick --circuit-csv circuit.csv --output-dir artifacts
 ```
 
-## **🚨 This repository is currently unstable and under active development 🚨**
+## Output structure
 
-## Citation
+For each task (`navigation2d`, `racing`) under `output-dir`:
+- `checkpoints/<task>_<profile>/`
+  - `model.pt`
+  - `metadata.json`
+  - `input_scaler.pkl`
+  - `output_scaler.pkl`
+- `csv/`
+  - Sample-sweep and dynamic-obstacle benchmark CSVs
+  - Transformer prediction CSVs (`*_u1.csv`, `*_u2.csv`)
+- `training_history.csv`
 
-```bibtex
-@article{zinage2024transformer,
-  title={Transformer-Based Model Predictive Path Integral Control},
-  author={Zinage, Shrenik and Zinage, Vrushabh and Bakolas, Efstathios},
-  journal={arXiv preprint arXiv:2412.17118},
-  year={2024}
-}
-```
+## Profiles
 
+- `quick`: reduced training workload for fast iteration; retains paper protocol structure and trend-oriented comparisons.
+- `paper`: full experiment scale from manuscript tables (long runtime).
 
+## Legacy compatibility
 
-
-
+Legacy scripts in `training/`, `diagnostics/`, and `src/` are retained as wrappers and now route to the package pipeline.

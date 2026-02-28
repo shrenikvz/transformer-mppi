@@ -1,0 +1,3 @@
+"""
+Training package initialization.
+"""
