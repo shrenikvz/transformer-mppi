@@ -4,7 +4,7 @@ Installable package and reproducible pipeline for **Transformer-based Model Pred
 
 ![Transformer-MPPI overview](figures/transformer_mppi.png)
 
-This refactor provides:
+This repo provides:
 - A reusable Python package API.
 - End-to-end data generation, training, and benchmarking pipelines.
 - Reproduction outputs (CSV metrics) aligned with the manuscript protocol.
@@ -75,6 +75,17 @@ For each task (`navigation2d`, `racing`) under `output-dir`:
 - `quick`: reduced training workload for fast iteration; retains paper protocol structure and trend-oriented comparisons.
 - `paper`: full experiment scale from manuscript tables (long runtime).
 
-## Legacy compatibility
+## Citation
 
-Legacy scripts in `training/`, `diagnostics/`, and `src/` are retained as wrappers and now route to the package pipeline.
+If you use this codebase in your research, please cite the paper:
+
+- [Transformer-Based Model Predictive Path Integral Control (arXiv:2412.17118)](https://arxiv.org/abs/2412.17118)
+
+```bibtex
+@article{zinage2024transformer,
+  title={Transformer-Based Model Predictive Path Integral Control},
+  author={Zinage, Shrenik and Zinage, Vrushabh and Bakolas, Efstathios},
+  journal={arXiv preprint arXiv:2412.17118},
+  year={2024}
+}
+```
