@@ -1,6 +1,6 @@
 """Transformer-MPPI package public API.
 
-Imports are resolved lazily to avoid eager torch initialization when only CLI/help is used.
+Imports are resolved lazily to avoid eager JAX initialization when only CLI/help is used.
 """
 
 __all__ = ["MPPI", "TransformerModel", "TransformerMPPIController", "TransformerArtifacts"]

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any
 
 import matplotlib.pyplot as plt
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
 from scipy.ndimage import distance_transform_edt
+
+from transformer_mppi.utils import Array, as_array, as_dtype, resolve_device
 
 
 @dataclass
@@ -22,11 +25,11 @@ class ObstacleMap:
         self,
         map_size: tuple[int, int],
         cell_size: float,
-        device: torch.device,
-        dtype: torch.dtype,
+        device: jax.Device | str | None,
+        dtype: Any,
     ) -> None:
-        self.device = torch.device(device)
-        self.dtype = dtype
+        self.device = resolve_device(device)
+        self.dtype = as_dtype(dtype)
         self.map_size = map_size
         self.cell_size = cell_size
 
@@ -39,8 +42,8 @@ class ObstacleMap:
         self.x_lim = [-x_range / 2, x_range / 2]
         self.y_lim = [-y_range / 2, y_range / 2]
 
-        self._map_torch: torch.Tensor | None = None
-        self._torch_cell_map_origin: torch.Tensor | None = None
+        self._map_jax: Array | None = None
+        self._cell_map_origin_jax: Array | None = None
         self.circle_obs_list: list[CircleObstacle] = []
 
     def clear_obstacles(self) -> None:
@@ -75,12 +78,15 @@ class ObstacleMap:
         self._map.fill(0)
         for obstacle in self.circle_obs_list:
             self._rasterize_circle(obstacle)
-        self.convert_to_torch()
+        self.convert_to_jax()
 
-    def convert_to_torch(self) -> torch.Tensor:
-        self._map_torch = torch.from_numpy(self._map).to(self.device, self.dtype)
-        self._torch_cell_map_origin = torch.from_numpy(self._cell_map_origin).to(self.device, self.dtype)
-        return self._map_torch
+    def convert_to_jax(self) -> Array:
+        self._map_jax = as_array(self._map, dtype=self.dtype, device=self.device)
+        self._cell_map_origin_jax = as_array(self._cell_map_origin, dtype=self.dtype, device=self.device)
+        return self._map_jax
+
+    def convert_to_torch(self) -> Array:
+        return self.convert_to_jax()
 
     def update_dynamic_obstacles(self, dt: float = 0.1) -> None:
         changed = False
@@ -106,26 +112,22 @@ class ObstacleMap:
         if changed:
             self.rebuild_occupancy()
 
-    def compute_cost(self, x: torch.Tensor) -> torch.Tensor:
-        if self._map_torch is None or self._torch_cell_map_origin is None:
-            raise ValueError("Obstacle map not prepared. Call convert_to_torch() first.")
+    def compute_cost(self, x: Array) -> Array:
+        if self._map_jax is None or self._cell_map_origin_jax is None:
+            raise ValueError("Obstacle map not prepared. Call convert_to_jax() first.")
 
-        if x.device != self.device or x.dtype != self.dtype:
-            x = x.to(self.device, self.dtype)
+        x = jnp.asarray(x, dtype=self.dtype)
+        x_occ = jnp.rint((x / self.cell_size) + self._cell_map_origin_jax).astype(jnp.int32)
 
-        x_occ = (x / self.cell_size) + self._torch_cell_map_origin
-        x_occ = torch.round(x_occ).long().to(self.device)
-
-        is_out_of_bound = torch.logical_or(
-            torch.logical_or(x_occ[..., 0] < 0, x_occ[..., 0] >= self._map_torch.shape[0]),
-            torch.logical_or(x_occ[..., 1] < 0, x_occ[..., 1] >= self._map_torch.shape[1]),
+        is_out_of_bound = jnp.logical_or(
+            jnp.logical_or(x_occ[..., 0] < 0, x_occ[..., 0] >= self._map_jax.shape[0]),
+            jnp.logical_or(x_occ[..., 1] < 0, x_occ[..., 1] >= self._map_jax.shape[1]),
         )
-        x_occ[..., 0] = torch.clamp(x_occ[..., 0], 0, self._map_torch.shape[0] - 1)
-        x_occ[..., 1] = torch.clamp(x_occ[..., 1], 0, self._map_torch.shape[1] - 1)
+        x0 = jnp.clip(x_occ[..., 0], 0, self._map_jax.shape[0] - 1)
+        x1 = jnp.clip(x_occ[..., 1], 0, self._map_jax.shape[1] - 1)
 
-        collisions = self._map_torch[x_occ[..., 0], x_occ[..., 1]]
-        collisions[is_out_of_bound] = 1.0
-        return collisions
+        collisions = self._map_jax[x0, x1]
+        return jnp.where(is_out_of_bound, jnp.asarray(1.0, dtype=self.dtype), collisions)
 
     def render(self, ax, zorder: int = 0) -> None:
         ax.set_xlim(self.x_lim)
@@ -144,28 +146,28 @@ class LaneMap:
         lane_width: float,
         map_size: tuple[int, int],
         cell_size: float,
-        device: torch.device,
-        dtype: torch.dtype,
+        device: jax.Device | str | None,
+        dtype: Any,
     ) -> None:
         if lane_width <= 0:
             raise ValueError("lane_width must be positive")
         if len(lane.shape) != 2 or lane.shape[1] != 3:
             raise ValueError("lane must have shape (N,3)")
 
-        self.device = torch.device(device)
-        self.dtype = dtype
+        self.device = resolve_device(device)
+        self.dtype = as_dtype(dtype)
 
         cell_map_dim = [int(map_size[0] / cell_size), int(map_size[1] / cell_size)]
         self._map = np.ones(cell_map_dim)
         self._cell_size = cell_size
         self._cell_map_origin = np.array([cell_map_dim[0] // 2, cell_map_dim[1] // 2])
-        self._torch_cell_map_origin = torch.from_numpy(self._cell_map_origin).to(self.device, self.dtype)
+        self._cell_map_origin_jax = as_array(self._cell_map_origin, dtype=self.dtype, device=self.device)
 
         self.x_lim = [-map_size[0] / 2, map_size[0] / 2]
         self.y_lim = [-map_size[1] / 2, map_size[1] / 2]
 
         self._populate_map(lane, lane_width)
-        self._map_torch = torch.tensor(self._map, device=self.device, dtype=self.dtype)
+        self._map_jax = as_array(self._map, dtype=self.dtype, device=self.device)
 
     def _populate_map(self, lane: np.ndarray, lane_width: float) -> None:
         for point in lane:
@@ -179,23 +181,19 @@ class LaneMap:
         max_distance = (lane_width / 2) / self._cell_size
         self._map = np.where(distance_map <= max_distance, 0, 1)
 
-    def compute_cost(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device != self.device or x.dtype != self.dtype:
-            x = x.to(self.device, self.dtype)
+    def compute_cost(self, x: Array) -> Array:
+        x = jnp.asarray(x, dtype=self.dtype)
+        x_occ = jnp.rint((x / self._cell_size) + self._cell_map_origin_jax).astype(jnp.int32)
 
-        x_occ = (x / self._cell_size) + self._torch_cell_map_origin
-        x_occ = torch.round(x_occ).long().to(self.device)
-
-        is_out_of_bound = torch.logical_or(
-            torch.logical_or(x_occ[..., 0] < 0, x_occ[..., 0] >= self._map_torch.shape[0]),
-            torch.logical_or(x_occ[..., 1] < 0, x_occ[..., 1] >= self._map_torch.shape[1]),
+        is_out_of_bound = jnp.logical_or(
+            jnp.logical_or(x_occ[..., 0] < 0, x_occ[..., 0] >= self._map_jax.shape[0]),
+            jnp.logical_or(x_occ[..., 1] < 0, x_occ[..., 1] >= self._map_jax.shape[1]),
         )
-        x_occ[..., 0] = torch.clamp(x_occ[..., 0], 0, self._map_torch.shape[0] - 1)
-        x_occ[..., 1] = torch.clamp(x_occ[..., 1], 0, self._map_torch.shape[1] - 1)
+        x0 = jnp.clip(x_occ[..., 0], 0, self._map_jax.shape[0] - 1)
+        x1 = jnp.clip(x_occ[..., 1], 0, self._map_jax.shape[1] - 1)
 
-        collisions = self._map_torch[x_occ[..., 0], x_occ[..., 1]]
-        collisions[is_out_of_bound] = 1.0
-        return collisions
+        collisions = self._map_jax[x0, x1]
+        return jnp.where(is_out_of_bound, jnp.asarray(1.0, dtype=self.dtype), collisions)
 
     def render_occupancy(self, ax) -> None:
         ax.imshow(self._map.T, origin="lower", extent=[*self.x_lim, *self.y_lim], cmap="gray_r", alpha=0.3)

@@ -16,6 +16,8 @@ This repo provides:
 pip install -e .
 ```
 
+For NVIDIA GPU execution, install a JAX build that matches your CUDA runtime before running the package.
+
 ## Package usage
 
 Distribution name is `transformer-mppi`; Python import path uses underscore:
@@ -27,7 +29,7 @@ from transformer_mppi import TransformerMPPIController
 ### Loading a trained controller
 
 ```python
-import torch
+import jax.numpy as jnp
 from transformer_mppi import TransformerMPPIController
 
 controller = TransformerMPPIController.from_checkpoint(
@@ -36,9 +38,9 @@ controller = TransformerMPPIController.from_checkpoint(
     dim_control=2,
     dynamics=my_dynamics_fn,
     cost_func=my_cost_fn,
-    u_min=torch.tensor([-2.0, -0.25]),
-    u_max=torch.tensor([2.0, 0.25]),
-    sigmas=torch.tensor([1.0, 1.0]),
+    u_min=jnp.array([-2.0, -0.25]),
+    u_max=jnp.array([2.0, 0.25]),
+    sigmas=jnp.array([1.0, 1.0]),
 )
 ```
 

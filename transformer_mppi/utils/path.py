@@ -29,16 +29,38 @@ def make_csv_paths(csv_path: str | Path) -> Tuple[np.ndarray, np.ndarray, np.nda
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-    path = []
-    path_x = []
-    path_y = []
+    rows: list[list[float]] = []
+    header: list[str] | None = None
 
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.reader(f)
         for row in reader:
-            x, y, theta = map(float, row)
-            path.append([x, y, theta])
-            path_x.append(x)
-            path_y.append(y)
+            if not row:
+                continue
+            try:
+                rows.append([float(value) for value in row])
+            except ValueError:
+                header = [value.strip().lower() for value in row]
 
-    return np.array(path), np.array(path_x), np.array(path_y)
+    if not rows:
+        raise ValueError(f"No numeric path rows found in {csv_path}")
+
+    numeric = np.asarray(rows, dtype=np.float64)
+    path_x = numeric[:, 0]
+    path_y = numeric[:, 1]
+
+    if header is not None and any(token in {"theta", "yaw", "heading"} for token in header):
+        theta_idx = next(i for i, name in enumerate(header) if name in {"theta", "yaw", "heading"})
+        theta = numeric[:, theta_idx]
+    elif numeric.shape[1] == 3:
+        theta = numeric[:, 2]
+    else:
+        dx = np.diff(path_x, append=path_x[-1])
+        dy = np.diff(path_y, append=path_y[-1])
+        if len(dx) > 1:
+            dx[-1] = dx[-2]
+            dy[-1] = dy[-2]
+        theta = np.arctan2(dy, dx)
+
+    path = np.column_stack([path_x, path_y, theta])
+    return path, path_x, path_y

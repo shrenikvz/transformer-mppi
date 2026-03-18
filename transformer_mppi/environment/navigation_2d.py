@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+from typing import Any
 
+import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 
 from transformer_mppi.environment.maps import ObstacleMap
 from transformer_mppi.environment.obstacles import generate_random_obstacles
-from transformer_mppi.utils import angle_normalize
+from transformer_mppi.utils import Array, angle_normalize, as_array, as_dtype, resolve_device, to_numpy
 
 
 class Navigation2DEnv:
@@ -23,15 +25,14 @@ class Navigation2DEnv:
         cell_size: float = 0.1,
         start_pos: tuple[float, float] = (-9.0, -9.0),
         goal_pos: tuple[float, float] = (9.0, 9.0),
-        device: torch.device | None = None,
-        dtype: torch.dtype = torch.float32,
+        device: jax.Device | str | None = None,
+        dtype: Any = jnp.float32,
         seed: int = 42,
     ) -> None:
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = dtype
+        self.device = resolve_device(device)
+        self.dtype = as_dtype(dtype)
         self.seed = seed
 
-        torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
 
@@ -42,14 +43,16 @@ class Navigation2DEnv:
         self.map_size = map_size
         self.cell_size = cell_size
 
-        self.u_min = torch.tensor([0.0, -1.0], device=self.device, dtype=self.dtype)
-        self.u_max = torch.tensor([2.0, 1.0], device=self.device, dtype=self.dtype)
+        self.u_min = as_array([0.0, -1.0], dtype=self.dtype, device=self.device)
+        self.u_max = as_array([2.0, 1.0], dtype=self.dtype, device=self.device)
 
         self._obstacle_map = ObstacleMap(map_size=map_size, cell_size=cell_size, device=self.device, dtype=self.dtype)
-        self._start_pos = torch.tensor(start_pos, device=self.device, dtype=self.dtype)
-        self._goal_pos = torch.tensor(goal_pos, device=self.device, dtype=self.dtype)
+        self._start_pos = as_array(start_pos, dtype=self.dtype, device=self.device)
+        self._goal_pos = as_array(goal_pos, dtype=self.dtype, device=self.device)
+        self._x_lim = as_array(self._obstacle_map.x_lim, dtype=self.dtype, device=self.device)
+        self._y_lim = as_array(self._obstacle_map.y_lim, dtype=self.dtype, device=self.device)
 
-        self._robot_state = torch.zeros(3, device=self.device, dtype=self.dtype)
+        self._robot_state = as_array(jnp.zeros(3, dtype=self.dtype), device=self.device)
         self.regenerate_map(seed=seed, dynamic_obstacles=dynamic_obstacles)
         self.reset()
 
@@ -70,54 +73,58 @@ class Navigation2DEnv:
             dynamic_speed_range=self.dynamic_speed_range,
         )
 
-    def reset(self) -> torch.Tensor:
-        self._robot_state[:2] = self._start_pos
-        self._robot_state[2] = angle_normalize(
-            torch.atan2(
+    def reset(self) -> Array:
+        heading = angle_normalize(
+            jnp.arctan2(
                 self._goal_pos[1] - self._start_pos[1],
                 self._goal_pos[0] - self._start_pos[0],
             )
         )
-        return self._robot_state.clone()
+        self._robot_state = self._robot_state.at[:2].set(self._start_pos)
+        self._robot_state = self._robot_state.at[2].set(heading)
+        return self._robot_state.copy()
 
-    def dynamics(self, state: torch.Tensor, action: torch.Tensor, delta_t: float = 0.1) -> torch.Tensor:
-        x = state[:, 0].view(-1, 1)
-        y = state[:, 1].view(-1, 1)
-        theta = state[:, 2].view(-1, 1)
+    def dynamics(self, state: Array, action: Array, delta_t: float = 0.1) -> Array:
+        state = jnp.asarray(state, dtype=self.dtype)
+        action = jnp.asarray(action, dtype=self.dtype)
 
-        v = torch.clamp(action[:, 0].view(-1, 1), self.u_min[0], self.u_max[0])
-        omega = torch.clamp(action[:, 1].view(-1, 1), self.u_min[1], self.u_max[1])
+        x = state[:, 0:1]
+        y = state[:, 1:2]
+        theta = state[:, 2:3]
+
+        v = jnp.clip(action[:, 0:1], self.u_min[0], self.u_max[0])
+        omega = jnp.clip(action[:, 1:2], self.u_min[1], self.u_max[1])
 
         theta = angle_normalize(theta)
-        new_x = x + v * torch.cos(theta) * delta_t
-        new_y = y + v * torch.sin(theta) * delta_t
+        new_x = x + v * jnp.cos(theta) * delta_t
+        new_y = y + v * jnp.sin(theta) * delta_t
         new_theta = angle_normalize(theta + omega * delta_t)
 
-        x_lim = torch.tensor(self._obstacle_map.x_lim, device=self.device, dtype=self.dtype)
-        y_lim = torch.tensor(self._obstacle_map.y_lim, device=self.device, dtype=self.dtype)
+        clamped_x = jnp.clip(new_x, self._x_lim[0], self._x_lim[1])
+        clamped_y = jnp.clip(new_y, self._y_lim[0], self._y_lim[1])
+        return jnp.concatenate([clamped_x, clamped_y, new_theta], axis=1)
 
-        clamped_x = torch.clamp(new_x, x_lim[0], x_lim[1])
-        clamped_y = torch.clamp(new_y, y_lim[0], y_lim[1])
-
-        return torch.cat([clamped_x, clamped_y, new_theta], dim=1)
-
-    def cost_function(self, state: torch.Tensor, action: torch.Tensor, info: dict | None = None) -> torch.Tensor:
-        goal_cost = torch.norm(state[:, :2] - self._goal_pos, dim=1)
-        pos_batch = state[:, :2].unsqueeze(1)
+    def cost_function(self, state: Array, action: Array, info: dict | None = None) -> Array:
+        del action, info
+        state = jnp.asarray(state, dtype=self.dtype)
+        goal_cost = jnp.linalg.norm(state[:, :2] - self._goal_pos, axis=1)
+        pos_batch = state[:, :2][:, None, :]
         obstacle_cost = self._obstacle_map.compute_cost(pos_batch).squeeze(1)
         return goal_cost + 10000.0 * obstacle_cost
 
-    def step(self, action: torch.Tensor, update_dynamic_obstacles: bool = True) -> tuple[torch.Tensor, bool, bool]:
-        action = torch.clamp(action, self.u_min, self.u_max)
-        next_state = self.dynamics(self._robot_state.unsqueeze(0), action.unsqueeze(0)).squeeze(0)
+    def step(self, action: Array, update_dynamic_obstacles: bool = True) -> tuple[Array, bool, bool]:
+        action = as_array(action, dtype=self.dtype, device=self.device)
+        action = jnp.clip(action, self.u_min, self.u_max)
+        next_state = self.dynamics(self._robot_state[None, :], action[None, :]).squeeze(0)
         self._robot_state = next_state
 
         if update_dynamic_obstacles and self.dynamic_obstacles > 0:
             self._obstacle_map.update_dynamic_obstacles(dt=0.1)
 
-        goal_reached = bool(torch.norm(self._robot_state[:2] - self._goal_pos) < 0.5)
-        collision = bool(self._obstacle_map.compute_cost(self._robot_state[:2].view(1, 1, 2)).item() >= 1.0)
-        return self._robot_state.clone(), goal_reached, collision
+        goal_reached = bool(np.asarray(jnp.linalg.norm(self._robot_state[:2] - self._goal_pos) < 0.5))
+        collision_cost = self._obstacle_map.compute_cost(self._robot_state[:2][None, None, :]).squeeze()
+        collision = bool(np.asarray(collision_cost >= 1.0))
+        return self._robot_state.copy(), goal_reached, collision
 
     def get_obstacle_centers(self, max_obstacles: int | None = None) -> np.ndarray:
         centers = np.array([obs.center for obs in self._obstacle_map.circle_obs_list], dtype=np.float64)
@@ -133,7 +140,12 @@ class Navigation2DEnv:
     def get_context(self, max_obstacles: int | None = None) -> np.ndarray:
         return self.get_obstacle_centers(max_obstacles=max_obstacles).reshape(-1)
 
-    def render(self, trajectory: list[np.ndarray] | None = None, title: str | None = None, save_path: str | Path | None = None) -> None:
+    def render(
+        self,
+        trajectory: list[np.ndarray] | None = None,
+        title: str | None = None,
+        save_path: str | Path | None = None,
+    ) -> None:
         fig, ax = plt.subplots(figsize=(8, 8))
         self._obstacle_map.render(ax)
         if trajectory:
@@ -141,7 +153,8 @@ class Navigation2DEnv:
             ax.plot(traj[:, 0], traj[:, 1], color="purple", linewidth=2.0)
             ax.scatter(traj[0, 0], traj[0, 1], color="blue", label="start")
             ax.scatter(traj[-1, 0], traj[-1, 1], color="red", label="end")
-        ax.scatter(self._goal_pos[0].item(), self._goal_pos[1].item(), color="green", marker="*", s=120, label="goal")
+        goal_pos = to_numpy(self._goal_pos)
+        ax.scatter(goal_pos[0], goal_pos[1], color="green", marker="*", s=120, label="goal")
         ax.grid(True, linestyle=":", alpha=0.5)
         if title:
             ax.set_title(title)

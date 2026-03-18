@@ -1,0 +1,2 @@
+[console_scripts]
+transformer-mppi = transformer_mppi.cli:main

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
 
 from transformer_mppi.controllers.mppi import MPPI
 from transformer_mppi.training.artifacts import TransformerArtifacts
+from transformer_mppi.utils import Array, as_array
 
 
 class TransformerMPPIController:
@@ -25,16 +27,16 @@ class TransformerMPPIController:
         checkpoint_dir: str | Path,
         dim_state: int,
         dim_control: int,
-        dynamics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-        cost_func: Callable[[torch.Tensor, torch.Tensor, dict], torch.Tensor],
-        u_min: torch.Tensor,
-        u_max: torch.Tensor,
-        sigmas: torch.Tensor,
+        dynamics: Callable[[Array, Array], Array],
+        cost_func: Callable[[Array, Array, dict], Array],
+        u_min: Array,
+        u_max: Array,
+        sigmas: Array,
         lambda_: float = 1.0,
         exploration: float = 0.2,
         use_sg_filter: bool = False,
-        device: torch.device | None = None,
-        dtype: torch.dtype = torch.float32,
+        device: jax.Device | str | None = None,
+        dtype: Any = jnp.float32,
     ) -> "TransformerMPPIController":
         artifacts = TransformerArtifacts.load(checkpoint_dir, device=device)
         mppi = MPPI(
@@ -60,7 +62,7 @@ class TransformerMPPIController:
         self.mppi.reset()
 
     def set_num_samples(self, num_samples: int) -> None:
-        self.mppi._num_samples = num_samples
+        self.mppi.set_num_samples(num_samples)
 
     def update_history(self, state: np.ndarray, context: np.ndarray) -> None:
         feature = np.concatenate([state, context]).astype(np.float64)
@@ -80,13 +82,13 @@ class TransformerMPPIController:
             )
         return src
 
-    def predict_mean_action_seq(self) -> torch.Tensor:
+    def predict_mean_action_seq(self) -> Array:
         src = self._get_src_sequence()
         mean_seq_np = self.artifacts.predict_action_sequence(src_sequence=src, device=self.mppi.device)
-        return torch.tensor(mean_seq_np, device=self.mppi.device, dtype=torch.float32)
+        return as_array(mean_seq_np, device=self.mppi.device, dtype=self.mppi._dtype)
 
-    def act(self, state: torch.Tensor, info: dict | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mean_action_seq = self.predict_mean_action_seq().to(self.mppi.device, self.mppi._dtype)
+    def act(self, state: Array, info: dict | None = None) -> tuple[Array, Array, Array]:
+        mean_action_seq = self.predict_mean_action_seq()
         action_seq, state_seq = self.mppi.forward(state=state, info=info or {}, mean_action_seq=mean_action_seq)
         action = action_seq[0, :]
         return action, action_seq, state_seq

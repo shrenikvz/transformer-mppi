@@ -4,16 +4,21 @@ import json
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import flax.serialization
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
 
 from transformer_mppi.controllers.transformer import TransformerModel
+from transformer_mppi.utils import as_array, resolve_device, to_numpy
 
 
 @dataclass
 class TransformerArtifacts:
     model: TransformerModel
+    params: Any
     input_scaler: object
     output_scaler: object
     horizon: int
@@ -22,23 +27,18 @@ class TransformerArtifacts:
     output_size: int
     model_config: dict
 
-    def predict_action_sequence(self, src_sequence: np.ndarray, device: torch.device | None = None) -> np.ndarray:
+    def predict_action_sequence(self, src_sequence: np.ndarray, device: jax.Device | str | None = None) -> np.ndarray:
         if src_sequence.shape != (self.k_history, self.input_size):
             raise ValueError(
                 f"Expected input shape {(self.k_history, self.input_size)}, got {tuple(src_sequence.shape)}"
             )
 
-        model_device = next(self.model.parameters()).device
-        use_device = device or model_device
-
+        use_device = resolve_device(device)
         src_scaled = self.input_scaler.transform(src_sequence)
-        src_tensor = torch.tensor(src_scaled, dtype=torch.float32, device=use_device).unsqueeze(1)
+        src_tensor = as_array(src_scaled, dtype=jnp.float32, device=use_device)[:, None, :]
 
-        self.model.eval()
-        with torch.no_grad():
-            out_scaled = self.model.predict_autoregressive(src_tensor, horizon=self.horizon)
-
-        out_scaled_np = out_scaled.squeeze(1).cpu().numpy()
+        out_scaled = self.model.predict_autoregressive(self.params, src_tensor, horizon=self.horizon)
+        out_scaled_np = to_numpy(out_scaled.squeeze(1))
         out = self.output_scaler.inverse_transform(out_scaled_np)
         return out
 
@@ -51,7 +51,7 @@ class TransformerArtifacts:
         input_scaler_path = checkpoint_dir / "input_scaler.pkl"
         output_scaler_path = checkpoint_dir / "output_scaler.pkl"
 
-        torch.save(self.model.state_dict(), model_path)
+        model_path.write_bytes(flax.serialization.to_bytes(self.params))
         metadata = {
             "horizon": self.horizon,
             "k_history": self.k_history,
@@ -67,7 +67,7 @@ class TransformerArtifacts:
             pickle.dump(self.output_scaler, f)
 
     @classmethod
-    def load(cls, checkpoint_dir: str | Path, device: torch.device | None = None) -> "TransformerArtifacts":
+    def load(cls, checkpoint_dir: str | Path, device: jax.Device | str | None = None) -> "TransformerArtifacts":
         checkpoint_dir = Path(checkpoint_dir)
 
         metadata = json.loads((checkpoint_dir / "metadata.json").read_text(encoding="utf-8"))
@@ -76,7 +76,7 @@ class TransformerArtifacts:
         with (checkpoint_dir / "output_scaler.pkl").open("rb") as f:
             output_scaler = pickle.load(f)
 
-        use_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_device = resolve_device(device)
         model = TransformerModel(
             input_size=metadata["input_size"],
             output_size=metadata["output_size"],
@@ -85,12 +85,23 @@ class TransformerArtifacts:
             nhead=metadata["model_config"]["nhead"],
             dropout=metadata["model_config"]["dropout"],
             device=use_device,
-        ).to(use_device)
-        state_dict = torch.load(checkpoint_dir / "model.pt", map_location=use_device)
-        model.load_state_dict(state_dict)
+        )
+
+        dummy_src = as_array(
+            jnp.zeros((metadata["k_history"], 1, metadata["input_size"]), dtype=jnp.float32),
+            device=use_device,
+        )
+        dummy_tgt = as_array(
+            jnp.zeros((metadata["horizon"], 1, metadata["output_size"]), dtype=jnp.float32),
+            device=use_device,
+        )
+        params = model.init_params(jax.random.PRNGKey(0), dummy_src, dummy_tgt)
+        params = flax.serialization.from_bytes(params, (checkpoint_dir / "model.pt").read_bytes())
+        params = jax.device_put(params, use_device)
 
         return cls(
             model=model,
+            params=params,
             input_scaler=input_scaler,
             output_scaler=output_scaler,
             horizon=metadata["horizon"],

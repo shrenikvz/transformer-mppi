@@ -5,13 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 
 from transformer_mppi.config import get_task_config
 from transformer_mppi.controllers import MPPI, TransformerMPPIController
 from transformer_mppi.environment import Navigation2DEnv, RacingEnv
 from transformer_mppi.training import TransformerArtifacts, train_transformer_model
-from transformer_mppi.utils import set_global_seed
+from transformer_mppi.utils import as_array, resolve_device, set_global_seed, to_numpy
 
 
 @dataclass
@@ -20,6 +19,10 @@ class EpisodeMetrics:
     steps: int
     success: bool
     collision: bool
+
+
+def _scalar(x) -> float:
+    return float(np.asarray(x).squeeze())
 
 
 def _build_navigation_env(cfg, seed: int, dynamic_obstacles: int = 0) -> Navigation2DEnv:
@@ -47,7 +50,7 @@ def _build_racing_env(cfg, seed: int, circuit_csv: str | Path, dynamic_obstacles
 
 
 def _init_mppi_navigation(cfg, env: Navigation2DEnv, num_samples: int, seed: int) -> MPPI:
-    sigmas = torch.tensor(cfg.control_sigmas, device=env.device, dtype=env.dtype)
+    sigmas = as_array(cfg.control_sigmas, device=env.device, dtype=env.dtype)
     return MPPI(
         horizon=cfg.horizon,
         num_samples=num_samples,
@@ -68,7 +71,7 @@ def _init_mppi_navigation(cfg, env: Navigation2DEnv, num_samples: int, seed: int
 
 
 def _init_mppi_racing(cfg, env: RacingEnv, num_samples: int, seed: int) -> MPPI:
-    sigmas = torch.tensor(cfg.control_sigmas, device=env.device, dtype=env.dtype)
+    sigmas = as_array(cfg.control_sigmas, device=env.device, dtype=env.dtype)
     return MPPI(
         horizon=cfg.horizon,
         num_samples=num_samples,
@@ -101,20 +104,20 @@ def collect_training_data_navigation(cfg) -> tuple[np.ndarray, np.ndarray]:
         mppi.reset()
 
         context = env.get_context(max_obstacles=cfg.num_obstacles)
-        state_np = state.cpu().numpy()
+        state_np = to_numpy(state)
         history = [np.concatenate([state_np, context]) for _ in range(cfg.k_history)]
 
         for _ in range(cfg.training.max_steps):
             inputs.append(np.stack(history, axis=0))
             action_seq, _ = mppi.forward(state=state)
-            targets.append(action_seq.detach().cpu().numpy())
+            targets.append(to_numpy(action_seq))
 
             next_state, goal_reached, collision = env.step(action_seq[0], update_dynamic_obstacles=False)
             state = next_state
             if collision or goal_reached:
                 break
 
-            state_np = state.cpu().numpy()
+            state_np = to_numpy(state)
             context = env.get_context(max_obstacles=cfg.num_obstacles)
             history.pop(0)
             history.append(np.concatenate([state_np, context]))
@@ -134,7 +137,7 @@ def collect_training_data_racing(cfg, circuit_csv: str | Path) -> tuple[np.ndarr
         mppi = _init_mppi_racing(cfg, env, num_samples=cfg.training.mppi_samples, seed=env_seed)
         mppi.reset()
 
-        current_state_np = state.cpu().numpy()
+        current_state_np = to_numpy(state)
         context = env.get_context(state=current_state_np, max_obstacles=cfg.num_obstacles, n_waypoints=cfg.racing_n_waypoints)
         history = [np.concatenate([current_state_np, context]) for _ in range(cfg.k_history)]
         current_path_index = 0
@@ -151,7 +154,7 @@ def collect_training_data_racing(cfg, circuit_csv: str | Path) -> tuple[np.ndarr
 
             inputs.append(np.stack(history, axis=0))
             action_seq, _ = mppi.forward(state=state, info=info)
-            targets.append(action_seq.detach().cpu().numpy())
+            targets.append(to_numpy(action_seq))
 
             next_state, goal_reached, collision = env.step(action_seq[0], update_dynamic_obstacles=False)
             state = next_state
@@ -161,7 +164,7 @@ def collect_training_data_racing(cfg, circuit_csv: str | Path) -> tuple[np.ndarr
             if collision or goal_reached:
                 break
 
-            current_state_np = state.cpu().numpy()
+            current_state_np = to_numpy(state)
             context = env.get_context(
                 state=current_state_np,
                 max_obstacles=cfg.num_obstacles,
@@ -188,7 +191,7 @@ def _run_navigation_episode_mppi(cfg, sample_size: int, seed: int, dynamic_obsta
         action = action_seq[0]
         next_state, goal_reached, collided = env.step(action, update_dynamic_obstacles=True)
 
-        total_cost += env.cost_function(next_state.unsqueeze(0), action.unsqueeze(0), {}).item()
+        total_cost += _scalar(env.cost_function(next_state[None, :], action[None, :], {}))
         state = next_state
         collision = collided
 
@@ -214,7 +217,7 @@ def _run_navigation_episode_transformer(
     controller = TransformerMPPIController(mppi=mppi, artifacts=artifacts)
     controller.reset()
 
-    state_np = state.cpu().numpy()
+    state_np = to_numpy(state)
     context = env.get_context(max_obstacles=cfg.num_obstacles)
     controller.update_history(state=state_np, context=context)
 
@@ -226,7 +229,7 @@ def _run_navigation_episode_transformer(
         action, _, _ = controller.act(state=state)
         next_state, goal_reached, collided = env.step(action, update_dynamic_obstacles=True)
 
-        total_cost += env.cost_function(next_state.unsqueeze(0), action.unsqueeze(0), {}).item()
+        total_cost += _scalar(env.cost_function(next_state[None, :], action[None, :], {}))
         state = next_state
         collision = collided
 
@@ -236,7 +239,7 @@ def _run_navigation_episode_transformer(
         if collided:
             break
 
-        state_np = state.cpu().numpy()
+        state_np = to_numpy(state)
         context = env.get_context(max_obstacles=cfg.num_obstacles)
         controller.update_history(state=state_np, context=context)
 
@@ -274,7 +277,7 @@ def _run_racing_episode_mppi(
         action = action_seq[0]
         next_state, goal_reached, collided = env.step(action, update_dynamic_obstacles=True)
 
-        total_cost += env.racing_cost_function(next_state.unsqueeze(0), action.unsqueeze(0), info).item()
+        total_cost += _scalar(env.racing_cost_function(next_state[None, :], action[None, :], info))
         state = next_state
         collision = collided
 
@@ -304,7 +307,7 @@ def _run_racing_episode_transformer(
     controller = TransformerMPPIController(mppi=mppi, artifacts=artifacts)
     controller.reset()
 
-    current_state_np = state.cpu().numpy()
+    current_state_np = to_numpy(state)
     context = env.get_context(
         state=current_state_np,
         max_obstacles=cfg.num_obstacles,
@@ -330,7 +333,7 @@ def _run_racing_episode_transformer(
         action, _, _ = controller.act(state=state, info=info)
         next_state, goal_reached, collided = env.step(action, update_dynamic_obstacles=True)
 
-        total_cost += env.racing_cost_function(next_state.unsqueeze(0), action.unsqueeze(0), info).item()
+        total_cost += _scalar(env.racing_cost_function(next_state[None, :], action[None, :], info))
         state = next_state
         collision = collided
 
@@ -343,7 +346,7 @@ def _run_racing_episode_transformer(
         if collided:
             break
 
-        current_state_np = state.cpu().numpy()
+        current_state_np = to_numpy(state)
         context = env.get_context(
             state=current_state_np,
             max_obstacles=cfg.num_obstacles,
@@ -641,7 +644,7 @@ def run_reproduction_task(
     else:
         x, y = collect_training_data_racing(cfg, circuit_csv=circuit_csv)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device()
     artifacts, history = train_transformer_model(
         input_sequences=x,
         target_sequences=y,

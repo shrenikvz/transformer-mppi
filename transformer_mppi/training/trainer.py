@@ -1,40 +1,51 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import optax
+from flax.training import train_state
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import QuantileTransformer
-from torch.utils.data import DataLoader, Dataset
 
 from transformer_mppi.controllers.transformer import TransformerModel
 from transformer_mppi.training.artifacts import TransformerArtifacts
-
-
-class SequenceDataset(Dataset):
-    def __init__(self, src: np.ndarray, target: np.ndarray):
-        self.src = src
-        self.target = target
-
-    def __len__(self) -> int:
-        return self.src.shape[0]
-
-    def __getitem__(self, idx: int):
-        src = torch.tensor(self.src[idx], dtype=torch.float32)
-        target = torch.tensor(self.target[idx], dtype=torch.float32)
-
-        tgt_input = torch.zeros_like(target)
-        tgt_input[1:, :] = target[:-1, :]
-        return src, tgt_input, target
+from transformer_mppi.utils import as_array, resolve_device
 
 
 @dataclass
 class TrainingHistory:
     train_losses: list[float]
     val_losses: list[float]
+
+
+def _prepare_batch(
+    src_batch: np.ndarray,
+    target_batch: np.ndarray,
+    device: jax.Device,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    src = as_array(src_batch, dtype=jnp.float32, device=device)
+    target = as_array(target_batch, dtype=jnp.float32, device=device)
+    tgt_input = jnp.concatenate(
+        [
+            jnp.zeros((target.shape[0], 1, target.shape[2]), dtype=target.dtype),
+            target[:, :-1, :],
+        ],
+        axis=1,
+    )
+
+    return (
+        jnp.swapaxes(src, 0, 1),
+        jnp.swapaxes(tgt_input, 0, 1),
+        jnp.swapaxes(target, 0, 1),
+    )
+
+
+def _batch_indices(num_samples: int, batch_size: int) -> list[np.ndarray]:
+    return [np.arange(start, min(start + batch_size, num_samples)) for start in range(0, num_samples, batch_size)]
 
 
 def train_transformer_model(
@@ -52,13 +63,14 @@ def train_transformer_model(
     learning_rate: float,
     val_fraction: float,
     seed: int,
-    device: torch.device,
+    device: jax.Device | str | None = None,
 ) -> tuple[TransformerArtifacts, TrainingHistory]:
     if input_sequences.ndim != 3:
         raise ValueError("input_sequences must have shape (N, k, input_size)")
     if target_sequences.ndim != 3:
         raise ValueError("target_sequences must have shape (N, horizon, output_size)")
 
+    use_device = resolve_device(device)
     input_size = input_sequences.shape[-1]
     output_size = target_sequences.shape[-1]
 
@@ -84,12 +96,6 @@ def train_transformer_model(
         shuffle=True,
     )
 
-    train_dataset = SequenceDataset(x_train, y_train)
-    val_dataset = SequenceDataset(x_val, y_val)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
     model = TransformerModel(
         input_size=input_size,
         output_size=output_size,
@@ -97,67 +103,98 @@ def train_transformer_model(
         num_layers=num_layers,
         nhead=nhead,
         dropout=dropout,
-        device=device,
-    ).to(device)
+        device=use_device,
+    )
 
-    criterion = nn.HuberLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    init_src = as_array(jnp.zeros((k_history, 1, input_size), dtype=jnp.float32), device=use_device)
+    init_tgt = as_array(jnp.zeros((horizon, 1, output_size), dtype=jnp.float32), device=use_device)
+    params = model.init_params(jax.random.PRNGKey(seed), init_src, init_tgt)
+
+    tx = optax.adam(learning_rate)
+    state = train_state.TrainState.create(
+        apply_fn=model.apply_model,
+        params=params,
+        tx=tx,
+    )
+
+    def loss_fn(params: Any, src: jax.Array, tgt_input: jax.Array, target: jax.Array, dropout_rng: jax.Array) -> jax.Array:
+        pred = model.apply_model(
+            params=params,
+            src=src,
+            tgt=tgt_input,
+            deterministic=False,
+            dropout_rng=dropout_rng,
+        )
+        return jnp.mean(optax.huber_loss(pred, target))
+
+    @jax.jit
+    def train_step(
+        state: train_state.TrainState,
+        src: jax.Array,
+        tgt_input: jax.Array,
+        target: jax.Array,
+        dropout_rng: jax.Array,
+    ) -> tuple[train_state.TrainState, jax.Array]:
+        grad_fn = jax.value_and_grad(loss_fn)
+        loss, grads = grad_fn(state.params, src, tgt_input, target, dropout_rng)
+        return state.apply_gradients(grads=grads), loss
+
+    @jax.jit
+    def eval_step(
+        params: Any,
+        src: jax.Array,
+        tgt_input: jax.Array,
+        target: jax.Array,
+    ) -> jax.Array:
+        pred = model.apply_model(params=params, src=src, tgt=tgt_input, deterministic=True)
+        return jnp.mean(optax.huber_loss(pred, target))
 
     best_val = float("inf")
-    best_state = None
+    best_params = state.params
     epochs_without_improve = 0
-
     train_losses: list[float] = []
     val_losses: list[float] = []
 
+    rng = np.random.default_rng(seed)
+    train_batch_ids = _batch_indices(len(x_train), batch_size)
+    val_batch_ids = _batch_indices(len(x_val), batch_size)
+    dropout_key = jax.random.PRNGKey(seed + 1)
+
     for _ in range(epochs):
-        model.train()
-        train_loss = 0.0
-        for src, tgt_input, target in train_loader:
-            src = src.permute(1, 0, 2).to(device)
-            tgt_input = tgt_input.permute(1, 0, 2).to(device)
-            target = target.permute(1, 0, 2).to(device)
+        shuffled_indices = rng.permutation(len(x_train))
+        train_loss_sum = 0.0
 
-            optimizer.zero_grad()
-            outputs = model(src, tgt_input)
-            loss = criterion(outputs, target)
-            loss.backward()
-            optimizer.step()
+        for batch_ids in train_batch_ids:
+            idx = shuffled_indices[batch_ids]
+            src_batch, tgt_input_batch, target_batch = _prepare_batch(x_train[idx], y_train[idx], use_device)
+            dropout_key, step_key = jax.random.split(dropout_key)
+            state, loss = train_step(state, src_batch, tgt_input_batch, target_batch, step_key)
+            train_loss_sum += float(np.asarray(loss)) * len(idx)
 
-            train_loss += loss.item() * src.shape[1]
-
-        train_loss /= len(train_dataset)
+        train_loss = train_loss_sum / len(x_train)
         train_losses.append(train_loss)
 
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for src, tgt_input, target in val_loader:
-                src = src.permute(1, 0, 2).to(device)
-                tgt_input = tgt_input.permute(1, 0, 2).to(device)
-                target = target.permute(1, 0, 2).to(device)
+        val_loss_sum = 0.0
+        for batch_ids in val_batch_ids:
+            src_batch, tgt_input_batch, target_batch = _prepare_batch(x_val[batch_ids], y_val[batch_ids], use_device)
+            loss = eval_step(state.params, src_batch, tgt_input_batch, target_batch)
+            val_loss_sum += float(np.asarray(loss)) * len(batch_ids)
 
-                outputs = model(src, tgt_input)
-                loss = criterion(outputs, target)
-                val_loss += loss.item() * src.shape[1]
-
-        val_loss /= len(val_dataset)
+        val_loss = val_loss_sum / len(x_val)
         val_losses.append(val_loss)
 
         if val_loss < best_val:
             best_val = val_loss
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_params = state.params
             epochs_without_improve = 0
         else:
             epochs_without_improve += 1
             if epochs_without_improve >= patience:
                 break
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
     artifacts = TransformerArtifacts(
         model=model,
+        params=best_params,
         input_scaler=input_scaler,
         output_scaler=output_scaler,
         horizon=horizon,

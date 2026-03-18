@@ -52,4 +52,4 @@ def generate_random_obstacles(
         if num_trial == max_iteration:
             raise RuntimeError("Cannot generate random obstacles (max iteration reached).")
 
-    obstacle_map.convert_to_torch()
+    obstacle_map.convert_to_jax()
